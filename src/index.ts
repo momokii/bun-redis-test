@@ -36,6 +36,18 @@ const cacheInvalidation = async () => {
     console.log('cache links invalidate')
 }
 
+const checkAndRenewCache = async (clientRedis: any, ttl_threshold: number, cache_key: string, cache_data: any) => {
+    const ttl = await clientRedis.ttl(cache_key)
+    if(ttl < ttl_threshold) {
+        await clientRedis.set(
+            cache_key, 
+            JSON.stringify(cache_data), {
+                EX: 60 * 5 // 5 min
+            }
+        )
+    }
+}
+
 // const invalidateCacheForItem = async (id: any) => {
 //     const keys = await clientRedis.keys('url-short:links:*');
 //     for (const key of keys) {
@@ -87,17 +99,8 @@ app.get('/links', async (c) => {
             links = cacheData.links 
             total_data = cacheData.total_data
 
-            const ttl = await clientRedis.ttl(cacheKey)
-
             // * re cache for renewing ttl if ttl less than threshold
-            if(ttl < ttl_threshold) {
-                await clientRedis.set(
-                    cacheKey, 
-                    JSON.stringify({links, total_data}), {
-                        EX: 60 * 5 // 5 min
-                    }
-                )
-            }
+            await checkAndRenewCache(clientRedis, ttl_threshold, cacheKey, {links, total_data})
             
         }
 
@@ -144,18 +147,8 @@ app.get('/links/:id', async (c) => {
 
         } else {
             links = JSON.parse(cache)
-            
-            const ttl = await clientRedis.ttl('url-short:'+c.req.param('id'))
 
-            // * re cache for renewing ttl if ttl less than threshold
-            if(ttl < ttl_threshold) {
-                await clientRedis.set(
-                    'url-short:'+c.req.param('id'),
-                    JSON.stringify(links), {
-                        EX: 60 * 5 // 5 min 
-                    }    
-                )
-            }
+            await checkAndRenewCache(clientRedis, ttl_threshold, 'url-short:'+c.req.param('id'), links)
 
         }
 
