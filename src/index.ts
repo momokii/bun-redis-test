@@ -36,19 +36,19 @@ const cacheInvalidation = async () => {
     console.log('cache links invalidate')
 }
 
-const invalidateCacheForItem = async (id: any) => {
-    const keys = await clientRedis.keys('url-short:links:*');
-    for (const key of keys) {
-        const cache = await clientRedis.get(key);
-        if (cache) {
-            const links = JSON.parse(cache);
-            // if (links.some(link => link.id === id)) {
-            //     await clientRedis.del(key);
-            //     console.log(`Cache invalidated for key: ${key}`);
-            // }
-        }
-    }
-};
+// const invalidateCacheForItem = async (id: any) => {
+//     const keys = await clientRedis.keys('url-short:links:*');
+//     for (const key of keys) {
+//         const cache = await clientRedis.get(key);
+//         if (cache) {
+//             const links = JSON.parse(cache);
+//             if (links.some(link => link.id === id)) {
+//                 await clientRedis.del(key);
+//                 console.log(`Cache invalidated for key: ${key}`);
+//             }
+//         }
+//     }
+// };
 
 
 // * ROUTES
@@ -60,6 +60,7 @@ app.get('/links', async (c) => {
         const cacheKey = `url-short:links:page:${page}:limit:${size}`
 
         let links = await clientRedis.get(cacheKey)
+        const ttl_threshold = 30 // 30 sec
         let total_data
 
         if(!links) {
@@ -86,13 +87,18 @@ app.get('/links', async (c) => {
             links = cacheData.links 
             total_data = cacheData.total_data
 
-            // * renewing ttl
-            await clientRedis.set(
-                cacheKey, 
-                JSON.stringify({links, total_data}), {
-                    EX: 60 * 5 // 5 min
-                }
-            )
+            const ttl = await clientRedis.ttl(cacheKey)
+
+            // * re cache for renewing ttl if ttl less than threshold
+            if(ttl < ttl_threshold) {
+                await clientRedis.set(
+                    cacheKey, 
+                    JSON.stringify({links, total_data}), {
+                        EX: 60 * 5 // 5 min
+                    }
+                )
+            }
+            
         }
 
         return c.json({
@@ -118,33 +124,39 @@ app.get('/links/:id', async (c) => {
         const cache = await clientRedis.get(`url-short:${c.req.param('id')}`)
 
         let links
+        const ttl_threshold = 30 // 30 sec
 
         if (!cache) {
-        let query = 'select id, short_url, long_url, created_at, expired_at, is_active, last_visited, total_visited, user_id from urls where 1=1'
+            let query = 'select id, short_url, long_url, created_at, expired_at, is_active, last_visited, total_visited, user_id from urls where 1=1'
 
-        query = query + " and id = " + c.req.param('id')
+            query = query + " and id = " + c.req.param('id')
 
-        links = (await sql.query(query))[0][0]
-        if(!links) throw_err('Data not found', 404)
+            links = (await sql.query(query))[0][0]
+            if(!links) throw_err('Data not found', 404)
 
-        await clientRedis.set(
-            'url-short:'+c.req.param('id'),
-            JSON.stringify(links), {
-                EX: 60 * 5 // 5 min
-            }
-        )
-        console.log('cache set')
-
-        } else {
-        links = JSON.parse(cache)
-
-        // * re cache for renewing ttl
             await clientRedis.set(
                 'url-short:'+c.req.param('id'),
                 JSON.stringify(links), {
-                    EX: 60 * 5 // 5 min 
-                }    
+                    EX: 60 * 5 // 5 min
+                }
             )
+            console.log('cache set')
+
+        } else {
+            links = JSON.parse(cache)
+            
+            const ttl = await clientRedis.ttl('url-short:'+c.req.param('id'))
+
+            // * re cache for renewing ttl if ttl less than threshold
+            if(ttl < ttl_threshold) {
+                await clientRedis.set(
+                    'url-short:'+c.req.param('id'),
+                    JSON.stringify(links), {
+                        EX: 60 * 5 // 5 min 
+                    }    
+                )
+            }
+
         }
 
         return c.json({
