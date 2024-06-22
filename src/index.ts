@@ -4,6 +4,7 @@ import { createClient } from 'redis'
 import sql from './db/db'
 import throw_err from './utils/error-handling'
 import {randomBytes} from 'crypto'
+import Redlock from 'redlock'
 
 const app = new Hono().basePath('/api/v1')
 const clientRedis = createClient({
@@ -11,6 +12,11 @@ const clientRedis = createClient({
         port: 6379,
         host: 'localhost' 
     }
+})
+const redlock = new Redlock([clientRedis], {
+    retryCount: 10,
+    retryDelay: 500, // in ms -> 0.5s
+    retryJitter: 200 // the max time in ms randomly added to retries
 })
 
 // * FUNCTION 
@@ -46,6 +52,54 @@ const checkAndRenewCache = async (clientRedis: any, ttl_threshold: number, cache
             }
         )
     }
+}
+
+// * cache lock with redlock
+const acquireLock = async (key: string, ttl: number) => {
+    const lock = await redlock.acquire([`locks:${key}`], ttl)
+    console.log('lock acquired')
+
+    return lock
+}
+
+const releaseLock = async (lock: any) => {
+    lock.release()
+    console.log('lock released')
+}
+
+// * cache lock without redlock
+const acquireLockRedis = async (lockKey: string, ttl: number) => {
+    const result = await clientRedis.set(`lock:${lockKey}`,'locked', {
+        EX: ttl,
+        NX: true
+    })
+
+    if (result === 'OK') console.log('lock acquired')
+    else console.log('lock not acquired')
+    
+    return result === 'OK'
+}
+
+const acquireLockRedisWithRetry = async (lockKey: string, ttl: number, maxRetries: number, retryDelay: number, retryJitter = 100) => {
+    let lockAcquired = false
+    let retryTime = retryDelay
+
+    for(let i = 0; i < maxRetries; i++) {
+        lockAcquired = await acquireLockRedis(lockKey, ttl)
+        if(lockAcquired) break
+
+        retryTime = retryDelay + Math.floor(Math.random() * retryJitter)
+        console.log(retryTime)
+
+        await new Promise(resolve => setTimeout(resolve, retryTime))
+    }
+
+    return lockAcquired
+}
+
+const releaseLockRedis = async (lockKey: string) => {
+    await clientRedis.del(lockKey)
+    console.log('lock released')
 }
 
 // const invalidateCacheForItem = async (id: any) => {
@@ -212,6 +266,170 @@ app.post('/links', async (c) => {
         )
     }
 })
+
+// * ----- ----- ----- REDIS LOCK IMPLEMENTS ----- ----- ----- ----- 
+app.get('/links/:id/locks', async (c) => {
+    const cacheKey = 'url-short:'+c.req.param('id')
+    const MAX_RETRIES = 10
+    const RETRY_DELAY = 100 // ms
+    const TTL_THRESHOLD = 30 // 30 sec
+
+    let lockAcquired
+    try {
+        const cache = await clientRedis.get(`url-short:${c.req.param('id')}`)
+
+        let links
+
+        if (!cache) {
+            lockAcquired = await acquireLockRedisWithRetry(cacheKey, 60, MAX_RETRIES, RETRY_DELAY)
+
+            if(!lockAcquired) throw_err('Resource is locked, try again later', 423)
+            
+            let query = 'select id, short_url, long_url, created_at, expired_at, is_active, last_visited, total_visited, user_id from urls where 1=1'
+
+            query = query + " and id = " + c.req.param('id')
+
+            links = (await sql.query(query))[0][0]
+            if(!links) throw_err('Data not found', 404)
+
+            await clientRedis.set(
+                cacheKey,
+                JSON.stringify(links), {
+                    EX: 60 * 5 // 5 min
+                }
+            )
+            console.log('cache set')
+
+        } else {
+            links = JSON.parse(cache)
+
+            await checkAndRenewCache(clientRedis, TTL_THRESHOLD, cacheKey, links)
+        }
+
+        return c.json({
+            errors: false,
+            data: {
+                links: links
+                }   
+        }, 200,)
+
+    } catch (e: any) {
+        throw new HTTPException(
+            e.statusCode, { message: e.message }
+        )
+    } finally {
+        if(lockAcquired) await releaseLockRedis(cacheKey)
+    }
+})
+
+
+
+app.patch('/links/:id/locks', async (c) => {
+    let connection
+    const cacheKey = 'url-short:'+c.req.param('id')
+    try {
+        const new_data = await c.req.json()
+
+        connection = await sql.getConnection()
+        await connection.beginTransaction()
+
+        const lockAcquired = await acquireLockRedis(cacheKey, 20)
+        if(!lockAcquired) throw_err('Resource is locked, try again later', 423)
+
+        const [check_url]= (await connection.query('select id, short_url, long_url, created_at, expired_at, is_active, last_visited, total_visited, user_id from urls where id = ?', [c.req.param('id')]))[0]
+
+        if(!check_url) throw_err('Data not found', 404)
+
+        const query = 'update urls set long_url = ?, expired_at = DATE_ADD(NOW(), INTERVAL 7 DAY) where id = ?'
+        await connection.query(query, [new_data.long_url, c.req.param('id')])
+
+        await connection.commit()
+
+        check_url.long_url = new_data.long_url
+
+        await clientRedis.set(
+            cacheKey,
+            JSON.stringify(check_url), {
+                EX: 60 * 5 // 5 min
+            }
+        )
+        console.log('cache edit set')
+        
+        await cacheInvalidation() // cache invalidation for paging cache
+
+        return c.json({
+            errors: false,
+            message: 'Data updated successfully'
+        }, 200)
+
+    } catch (e: any) {
+        if(connection) await connection.rollback()
+        
+        throw new HTTPException(
+            e.statusCode, { message: e.message }
+        )
+    } finally {
+        connection.release()
+
+        await releaseLockRedis(cacheKey)
+    }
+})
+
+
+
+app.patch('/links/:id/locks2', async (c) => {
+    let connection, lock
+    try {
+        const new_data = await c.req.json()
+        const cacheKey = 'url-short:'+c.req.param('id') 
+
+        connection = await sql.getConnection()
+        await connection.beginTransaction()
+
+        // * lock the cache
+        lock = await acquireLock(cacheKey, 5000)
+
+        const [check_url]= (await connection.query('select id, short_url, long_url, created_at, expired_at, is_active, last_visited, total_visited, user_id from urls where id = ?', [c.req.param('id')]))[0]
+
+        if(!check_url) throw_err('Data not found', 404)
+
+        const query = 'update urls set long_url = ?, expired_at = DATE_ADD(NOW(), INTERVAL 7 DAY) where id = ?'
+        await connection.query(query, [new_data.long_url, c.req.param('id')])
+
+        await connection.commit()
+
+        check_url.long_url = new_data.long_url
+
+        await clientRedis.set(
+            cacheKey,
+            JSON.stringify(check_url), {
+                EX: 60 * 5 // 5 min
+            }
+        )
+        console.log('cache edit set')
+        
+        await cacheInvalidation() // cache invalidation for paging cache
+
+        return c.json({
+            errors: false,
+            message: 'Data updated successfully'
+        }, 200)
+
+    } catch (e: any) {
+        if(connection) await connection.rollback()
+        
+        throw new HTTPException(
+            e.statusCode, { message: e.message }
+        )
+
+    } finally {
+
+        connection.release()
+
+        if(lock) await releaseLock(lock)
+    }
+})
+// * ----- ----- ----- ----- ----- ----- ----- 
 
 
 app.patch('/links/:id', async (c) => {
