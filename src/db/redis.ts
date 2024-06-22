@@ -33,36 +33,54 @@ RedisClient.on('error', (err) => console.error('Redis Client Error', err))
 RedisClient.connect()
 
 export async function cacheInvalidation(cache_key: any): Promise<void> {
-    const keys = await RedisClient.keys(cache_key)
+    try {
+        const keys = await RedisClient.keys(cache_key)
 
-    for (const key of keys) await RedisClient.del(key)
+        for (const key of keys) await RedisClient.del(key)
 
-    console.log('cache links invalidated')
+        console.log('cache links invalidated')
+
+    } catch (e) {
+        console.error('Error invalidating cache', e)
+    }
 }
 
 export async function checkAndRenewCache({ ttl_threshold, cache_key, cache_data }: CacheOptions): Promise<void> {
-    const ttl = await RedisClient.ttl(cache_key)
+    try {
+        const ttl = await RedisClient.ttl(cache_key)
 
-    if (ttl < ttl_threshold) {
-        await RedisClient.set(
-            cache_key,
-            JSON.stringify(cache_data), {
-                EX: 60 * 5 // 5 min
-            }
-        )
+        if (ttl < ttl_threshold) {
+            await RedisClient.set(
+                cache_key,
+                JSON.stringify(cache_data), {
+                    EX: 60 * 5 // 5 min
+                }
+            )
+        }
+    } catch (e) {
+        console.error('Error checking and renewing cache', e)
     }
 }
 
 export async function acquireLock({ lockKey, ttl }: LockOptions): Promise<boolean> {
-    const result = await RedisClient.set(`lock:${lockKey}`, 'locked', {
-        EX: ttl,
-        NX: true
-    })
+    try {
+        const result = await RedisClient.set(`lock:${lockKey}`, 'locked', {
+            EX: ttl,
+            NX: true
+        })
 
-    if (result === 'OK') console.log('lock acquired')
-    else console.log('lock not acquired')
-    
-    return false   
+        if (result === 'OK') {
+            console.log('lock acquired')
+            return true
+        } else {
+            console.log('lock not acquired')
+            return false
+        }
+
+    } catch (e) {
+        console.error('Error acquiring lock', e)
+        return false
+    }
 }
 
 export async function acquireLockWithRetry({ 
@@ -72,30 +90,48 @@ export async function acquireLockWithRetry({
     retryDelay = 100,
     retryJitter 
 }: LockRetryOptions): Promise<boolean> {
-    let lockAcquired = false
-    let retryTime = retryDelay
+    try {
+        let lockAcquired = false
+        let retryTime = retryDelay
 
-    for (let i = 0; i < maxRetries; i++) {
-        lockAcquired = await acquireLock({ lockKey, ttl });
-        if (lockAcquired) break
+        for (let i = 0; i < maxRetries; i++) {
+            lockAcquired = await acquireLock({ lockKey, ttl });
+            if (lockAcquired) break
 
-        if (retryJitter) retryTime += Math.floor(Math.random() * retryJitter)
+            if (retryJitter) retryTime += Math.floor(Math.random() * retryJitter)
 
-        await new Promise(resolve => setTimeout(resolve, retryTime));
+            await new Promise(resolve => setTimeout(resolve, retryTime));
+        }
+
+        return lockAcquired
+
+    } catch(e) {
+        console.error('Error acquiring lock with retry', e)
+        return false
     }
-
-    return lockAcquired
 }
 
 export async function extendLock(lockKey: string, ttl: number): Promise<boolean> {
-    const ttlNow = await RedisClient.ttl(`lock:${lockKey}`)
-    if (ttlNow < 0) return false // -2 if key does not exist
+    try {
+        const ttlNow = await RedisClient.ttl(`lock:${lockKey}`)
+        if (ttlNow < 0) return false // -2 if key does not exist
 
-    const result = await RedisClient.expire(`lock:${lockKey}`, ttl + ttlNow)
-    return result
+        const result = await RedisClient.expire(`lock:${lockKey}`, ttl + ttlNow)
+
+        return result
+
+    } catch(e) {
+        console.error('Error extending lock', e)
+        return false
+    }
 }
 
 export async function releaseLock(lockKey: string): Promise<void> {
-    await RedisClient.del(`lock:${lockKey}`)
-    console.log('lock released')
+    try {
+        await RedisClient.del(`lock:${lockKey}`)
+        console.log('lock released')
+
+    } catch(e) {
+        console.error('Error releasing lock', e)
+    }   
 }
