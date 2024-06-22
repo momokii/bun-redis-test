@@ -65,7 +65,7 @@ export async function acquireLock({ lockKey, ttl }: LockOptions): Promise<boolea
     return false   
 }
 
-export async function acquireLockWith({ 
+export async function acquireLockWithRetry({ 
     lockKey, 
     ttl, 
     maxRetries = 10, 
